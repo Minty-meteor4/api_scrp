@@ -1,0 +1,8 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.log
+.claude
+anthropic_keys.txt
+openai_keys.txt
