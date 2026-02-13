@@ -46,25 +46,38 @@ if [ ! -f .env ]; then
     echo ""
 fi
 
-# 4. Install systemd service
-echo "[3/5] Installing systemd service..."
+# 4. Install systemd services
+echo "[3/6] Installing systemd services..."
 SCANNER_DIR=$(pwd)
-# Update WorkingDirectory and ExecStart paths in service file
 sed "s|/root/scanner|${SCANNER_DIR}|g" scanner.service > /etc/systemd/system/scanner.service
+sed "s|/root/scanner|${SCANNER_DIR}|g" telegram_bot.service > /etc/systemd/system/telegram_bot.service
 
-# 5. Enable and start
-echo "[4/5] Enabling and starting service..."
+# 5. Enable and start scanner
+echo "[4/6] Enabling and starting scanner..."
 systemctl daemon-reload
 systemctl enable scanner
 systemctl restart scanner
 
-echo "[5/5] Done!"
+# 6. Start Telegram bot (if configured)
+echo "[5/6] Starting Telegram bot..."
+if grep -q "TELEGRAM_BOT_TOKEN" .env 2>/dev/null; then
+    systemctl enable telegram_bot
+    systemctl restart telegram_bot
+    echo "  Telegram bot started!"
+else
+    echo "  Skipped (no TELEGRAM_BOT_TOKEN in .env)"
+fi
+
+echo "[6/6] Done!"
 echo ""
-echo "=== Scanner is running ==="
-echo "  Status:    systemctl status scanner"
-echo "  Logs:      journalctl -u scanner -f"
-echo "  Log file:  tail -f ${SCANNER_DIR}/scanner.log"
-echo "  Stop:      systemctl stop scanner"
-echo "  Restart:   systemctl restart scanner"
+echo "=== Services running ==="
+echo "  Scanner:    systemctl status scanner"
+echo "  TG Bot:     systemctl status telegram_bot"
+echo "  Logs:       tail -f ${SCANNER_DIR}/scanner.log"
+echo "  TG Log:     tail -f ${SCANNER_DIR}/telegram_bot.log"
+echo "  Stop:       systemctl stop scanner telegram_bot"
+echo "  Restart:    systemctl restart scanner telegram_bot"
 echo ""
 systemctl status scanner --no-pager
+echo ""
+systemctl status telegram_bot --no-pager 2>/dev/null || true

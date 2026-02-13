@@ -6,3 +6,4 @@ __pycache__/
 .claude
 anthropic_keys.txt
 openai_keys.txt
+empty_keys.txt

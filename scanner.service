@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/scanner
-ExecStart=/root/scanner/venv/bin/python3 -u key_scanner.py
+WorkingDirectory=/root/apikeys
+ExecStart=/root/apikeys/venv/bin/python3 -u key_scanner.py
 Restart=always
 RestartSec=10
 # Prevent OOM kills
@@ -15,10 +15,10 @@ OOMScoreAdjust=-500
 # Auto-restart if memory exceeds 512MB
 MemoryMax=512M
 # Env file (optional, for tokens)
-EnvironmentFile=-/root/scanner/.env
+EnvironmentFile=-/root/apikeys/.env
 
-StandardOutput=append:/root/scanner/scanner.log
-StandardError=append:/root/scanner/scanner.log
+StandardOutput=append:/root/apikeys/scanner.log
+StandardError=append:/root/apikeys/scanner.log
 
 [Install]
 WantedBy=multi-user.target
